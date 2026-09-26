@@ -1,7 +1,9 @@
 [deps]
+Cairo = "159f3aea-2a34-519c-b102-8c37f9878175"
 DataFrames = "a93c6f00-e57d-5684-b7b6-d8193f3e46c0"
 DataInterpolations = "82cc6244-b520-54b8-b5a6-8a565e85f1d0"
 Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
+DiffEqCallbacks = "459566f4-90b8-5000-8ac3-15dfb0a30def"
 Gadfly = "c91e804a-d5a3-530f-b6f0-dfbca275c004"
 HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
 JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
