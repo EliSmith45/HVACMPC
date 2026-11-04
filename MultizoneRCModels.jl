@@ -215,11 +215,12 @@ function BuildingGraphModel(zones::Vector{ZoneDef}, walls::Vector{WallDef},
     )
 end
 
-function (m::BuildingGraphModel)(du, u, p, t)
-
+# In-place right-hand side shared by the callable struct and the `ODEFunction`
+# wrapper below.  The model is a linear RC network, so the state Jacobian and
+# the parameter Jacobian are computed analytically (see `_jac!`/`_paramjac!`).
+@inline function _rhs!(du, u, p, t, m::BuildingGraphModel)
     t_oa = m.T_oa(t)
     i_solar = m.I_solar(t)
-    
 
     du .= 0.0
 
@@ -236,11 +237,136 @@ function (m::BuildingGraphModel)(du, u, p, t)
     end
 
     @inbounds for i in eachindex(m.edge_src)
-        du[m.edge_dst[i]] += (u[m.edge_src[i]] - u[m.edge_dst[i]]) * exp(p.R_internal[i])
-        du[m.edge_src[i]] += (u[m.edge_dst[i]] - u[m.edge_src[i]]) * exp(p.R_internal[i])
+        g = exp(p.R_internal[i])
+        du[m.edge_dst[i]] += (u[m.edge_src[i]] - u[m.edge_dst[i]]) * g
+        du[m.edge_src[i]] += (u[m.edge_dst[i]] - u[m.edge_src[i]]) * g
     end
 
-    @. du *= exp(p.C)
+    @inbounds for i in eachindex(du)
+        du[i] *= exp(p.C[i])
+    end
+
+    return nothing
+end
+
+function (m::BuildingGraphModel)(du, u, p, t)
+    _rhs!(du, u, p, t, m)
+end
+
+# Analytical state Jacobian ∂f/∂u for the linear RC model.  The Jacobian is
+# independent of `u` (and of `t`), and only depends on the conductance/capacitance
+# parameters `p`.
+@inline function _jac!(J, u, p, t, m::BuildingGraphModel)
+    fill!(J, 0.0)
+    n = m.num_nodes
+
+    @inbounds begin
+        for (i, k) in enumerate(m.ambient_nodes)
+            J[k, k] -= exp(p.R_ambient[i])
+        end
+
+        for i in eachindex(m.edge_src)
+            g = exp(p.R_internal[i])
+            s = m.edge_src[i]
+            d = m.edge_dst[i]
+            J[d, d] -= g
+            J[s, s] -= g
+            J[d, s] += g
+            J[s, d] += g
+        end
+
+        # `du .= unscaled_du .* exp.(p.C)`: each row is scaled by its capacitance.
+        for i in 1:n
+            ci = exp(p.C[i])
+            for j in 1:n
+                J[i, j] *= ci
+            end
+        end
+    end
+
+    return nothing
+end
+
+# Analytical parameter Jacobian ∂f/∂p.  `offC`, `offRi`, `offRa` and `offAs`
+# are the 1-based column offsets of each parameter block in the flat
+# `ComponentArray` data vector (`C`, `R_internal`, `R_ambient`, `α_solar`).
+@inline function _paramjac!(pJ, u, p, t, m::BuildingGraphModel,
+                            scratch, offC, offRi, offRa, offAs)
+    fill!(pJ, 0.0)
+    db = scratch
+    fill!(db, 0.0)
+
+    t_oa = m.T_oa(t)
+    i_solar = m.I_solar(t)
+
+    @inbounds begin
+        # Unscaled RHS, before the final per-node `* exp(p.C)` scaling.
+        for (i, k) in enumerate(m.ambient_nodes)
+            db[k] += (t_oa - u[k]) * exp(p.R_ambient[i])
+        end
+        for (i, k) in enumerate(m.solar_nodes)
+            db[k] += i_solar * exp(p.α_solar[i])
+        end
+        for (i, k) in enumerate(m.hvac_nodes)
+            db[k] += m.Q_hvac[i](t) + m.Q_int[i](t)
+        end
+        for i in eachindex(m.edge_src)
+            g = exp(p.R_internal[i])
+            s = m.edge_src[i]
+            d = m.edge_dst[i]
+            db[d] += (u[s] - u[d]) * g
+            db[s] += (u[d] - u[s]) * g
+        end
+
+        # ∂/∂(log C_k) of `db_k * exp(C_k)` is `db_k * exp(C_k)`.
+        for k in 1:m.num_nodes
+            pJ[k, offC + k - 1] = db[k] * exp(p.C[k])
+        end
+
+        for (i, k) in enumerate(m.ambient_nodes)
+            pJ[k, offRa + i - 1] = (t_oa - u[k]) * exp(p.R_ambient[i]) * exp(p.C[k])
+        end
+        for (i, k) in enumerate(m.solar_nodes)
+            pJ[k, offAs + i - 1] = i_solar * exp(p.α_solar[i]) * exp(p.C[k])
+        end
+        for i in eachindex(m.edge_src)
+            g = exp(p.R_internal[i])
+            s = m.edge_src[i]
+            d = m.edge_dst[i]
+            pJ[d, offRi + i - 1] = (u[s] - u[d]) * g * exp(p.C[d])
+            pJ[s, offRi + i - 1] = (u[d] - u[s]) * g * exp(p.C[s])
+        end
+    end
+
+    return nothing
+end
+
+# Build an `ODEFunction` with analytical state/parameter Jacobians so that
+# implicit solvers and `InterpolatingAdjoint(autojacvec = false)` can avoid
+# automatic differentiation of the right-hand side altogether.
+function _odef(m::BuildingGraphModel)
+    n = m.num_nodes
+    nC = length(m.params.C)
+    nRi = length(m.params.R_internal)
+    nRa = length(m.params.R_ambient)
+    nAs = length(m.params.α_solar)
+    @assert nC == n
+    @assert nC + nRi + nRa + nAs == length(m.params)
+
+    offC = 1
+    offRi = offC + nC
+    offRa = offRi + nRi
+    offAs = offRa + nRa
+
+    scratch = Vector{Float64}(undef, n)
+
+    f = (du, u, p, t) -> _rhs!(du, u, p, t, m)
+    jac = (J, u, p, t) -> _jac!(J, u, p, t, m)
+    paramjac = (pJ, u, p, t) -> _paramjac!(pJ, u, p, t, m, scratch,
+                                           offC, offRi, offRa, offAs)
+
+    return ODEFunction{true}(f; jac = jac, paramjac = paramjac,
+                             jac_prototype = zeros(n, n))
 end
 
 function generate_sample_exogenous_inputs(tspan, steps, num_hvac_nodes;
@@ -312,14 +438,12 @@ function _check_air_node_data(air_idx, data_air, n_t)
     return nothing
 end
 
-function _air_node_solution_ok(sol, n_t)
-    length(sol.u) == n_t || return false
-    return all(all(isfinite, u) for u in sol.u)
-end
-
-function _air_node_residual_loss(sol, air_idx, data_air, w)
+function _air_node_residual_loss(sol, air_idx, data_air, w, tgrid)
+    u = zero(sol.u[1])
     loss = 0.0
-    for (i, u) in enumerate(sol.u)
+    for (i, ti) in enumerate(tgrid)
+        sol(u, ti)
+        all(isfinite, u) || return Inf
         for (k, idx) in enumerate(air_idx)
             r = u[idx] - data_air[i, k]
             loss += w[i] * r * r
@@ -334,25 +458,28 @@ function air_node_residual_loss(topo::BuildingGraphModel, u0, tspan, p, data_air
     _check_air_node_data(air_idx, data_air, length(tgrid))
     w = _air_node_quadrature_weights(tgrid)
 
-    sol = solve(ODEProblem(topo, u0, tspan, p), alg;
-                reltol = reltol, abstol = abstol, saveat = tgrid)
-    _air_node_solution_ok(sol, length(tgrid)) || return Inf
-    return _air_node_residual_loss(sol, air_idx, data_air, w)
+    # Dense forward solve (no `saveat`): `saveat` disables the dense interpolant,
+    # which would force the adjoint to checkpoint/re-solve forward intervals.
+    sol = solve(ODEProblem(_odef(topo), u0, tspan, p), alg;
+                reltol = reltol, abstol = abstol)
+    return _air_node_residual_loss(sol, air_idx, data_air, w, tgrid)
 end
 
 function air_node_residual_loss_and_gradient(topo::BuildingGraphModel, u0, tspan, p,
                                              data_air, tgrid;
                                              alg = Tsit5(),
-                                             sensealg = InterpolatingAdjoint(autojacvec = ReverseDiffVJP()),
+                                             sensealg = InterpolatingAdjoint(autojacvec = false),
                                              reltol = 1e-8, abstol = 1e-10)
     air_idx = topo.hvac_nodes
     _check_air_node_data(air_idx, data_air, length(tgrid))
     w = _air_node_quadrature_weights(tgrid)
 
-    sol = solve(ODEProblem(topo, u0, tspan, p), alg;
-                reltol = reltol, abstol = abstol, saveat = tgrid)
-    _air_node_solution_ok(sol, length(tgrid)) || return (Inf, zero(p))
-    loss = _air_node_residual_loss(sol, air_idx, data_air, w)
+    # Dense forward solve (see `air_node_residual_loss`): this avoids adjoint
+    # checkpointing and its large allocation overhead.
+    sol = solve(ODEProblem(_odef(topo), u0, tspan, p), alg;
+                reltol = reltol, abstol = abstol)
+    loss = _air_node_residual_loss(sol, air_idx, data_air, w, tgrid)
+    isfinite(loss) || return (Inf, zero(p))
 
     # discrete cost gradient at each data time: ∂/∂u [wᵢ ‖u_air − data_air[i,:]‖²]
     function dgdu_discrete(out, u, p_, t, i)
@@ -472,7 +599,7 @@ loss_short(p) = air_node_residual_loss(topo, u0_true, (0.0, tchk[end]), p, dchk,
                                        reltol = 1e-10, abstol = 1e-12)
 
 @time g_adj = air_node_residual_gradient(topo, u0_true, (0.0, tchk[end]), p_init_log, dchk, tchk;
-                                   reltol = 1e-8, abstol = 1e-8)
+                                   reltol = 1e-10, abstol = 1e-12)
 @time g_fwd = ForwardDiff.gradient(loss_short, p_init_log)
 
 println("=== adjoint_sensitivities vs ForwardDiff (short window) ===")
@@ -545,9 +672,10 @@ println("\ninitial loss = ", round(opt_objective(u0_opt, nothing), sigdigits = 5
 
 nlopt_alg = NLopt.Opt(:LD_LBFGS, length(u0_opt))
 NLopt.maxeval!(nlopt_alg, 300)
-NLopt.stopval!(nlopt_alg, 1e-3)
+NLopt.stopval!(nlopt_alg, .005)
 
-@time opt_sol = solve(optprob, nlopt_alg; verbose = false)
+@time opt_sol = solve(optprob, nlopt_alg; verbose = true, show_trace = true, show_every = 1)
+
 
 p_rec_log = pack(opt_sol.u)
 println("\n=== Optimization.jl (NLopt LD_LBFGS) recovery ===")
