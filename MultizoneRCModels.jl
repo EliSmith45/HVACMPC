@@ -8,19 +8,32 @@ using Gadfly
 
 #= structs =#
 
+# Number of hourly knots in a solar-gain profile: one coefficient per hour of
+# day (0:00–23:00), interpolated periodically across the day boundary.
+const SOLAR_PROFILE_LENGTH = 24
+
+# Accept either a scalar (constant all day) or a 24-element hourly vector.
+_as_solar_profile(α::Real) = fill(Float64(α), SOLAR_PROFILE_LENGTH)
+function _as_solar_profile(α::AbstractVector)
+    length(α) == SOLAR_PROFILE_LENGTH || throw(DimensionMismatch(
+        "solar gain profile must have $(SOLAR_PROFILE_LENGTH) hourly entries, got $(length(α))"))
+    return collect(Float64.(α))
+end
+
 struct ZoneDef
     id::Symbol
     cAir::Float64
     cMass::Float64
     rAirAm::Float64
     rAirMass::Float64
-    α::Float64 #solar heat gain coefficient to thermal mass
+    α::Vector{Float64} #hourly solar heat gain coefficients to thermal mass (24 h)
     has_solar::Bool
     has_infiltration::Bool #heat transfer from ambient direct to air, bypassing walls
 end
 
 function ZoneDef(id::Symbol; cAir=100.0, cMass=1000.0, rAirAm=0.001, rAirMass = 0.0001, α=0.0)
-    return ZoneDef(id, cAir, cMass, rAirAm, rAirMass, α, α != 0.0, rAirAm != 0.0)
+    α = _as_solar_profile(α)
+    return ZoneDef(id, cAir, cMass, rAirAm, rAirMass, α, any(!iszero, α), rAirAm != 0.0)
 end
 
 struct WallDef
@@ -30,14 +43,16 @@ struct WallDef
     num_nodes::Int
     c::Vector{Float64}
     r::Vector{Float64}
-    α_a::Float64 #solar to the wall capacitor on side a
-    α_b::Float64 #solar to the wall capacitor on side b
+    α_a::Vector{Float64} #hourly solar to the wall capacitor on side a (24 h)
+    α_b::Vector{Float64} #hourly solar to the wall capacitor on side b (24 h)
 end
 
 function WallDef(id::Symbol, zone_a::Symbol, zone_b::Symbol, num_nodes::Int; c=fill(100.0, num_nodes), r=fill(0.001, num_nodes + 1), α_a=0.0, α_b=0.0)
     @assert length(c) == num_nodes "Length of c must equal num_nodes"
     @assert length(r) == num_nodes + 1 "Length of r must equal num_nodes + 1"
-   
+
+    α_a = _as_solar_profile(α_a)
+    α_b = _as_solar_profile(α_b)
     return WallDef(id, zone_a, zone_b, num_nodes, c, r, α_a, α_b)
 end
 
@@ -65,8 +80,9 @@ struct BuildingGraphModel{T_OA, T_SOL, T_HVAC}
     occ_end::Vector{Float64}
 
     #differentiable array parameters, stored in ABSOLUTE (physical) units:
-    #  C, R_internal, R_ambient, α_solar : structural RC parameters
-    #  Q_int_occ, Q_int_unocc           : internal heat gains (per zone)
+    #  C, R_internal, R_ambient : structural RC parameters
+    #  α_solar                  : hourly solar gain coefficients (n_solar × 24)
+    #  Q_int_occ, Q_int_unocc   : internal heat gains (per zone)
     # The ODE right-hand side works in log-space; `train!` maps absolute ↔ log
     # and writes learned values back here in absolute form.
     params::ComponentArray
@@ -122,7 +138,7 @@ function BuildingGraphModel(zones::Vector{ZoneDef}, walls::Vector{WallDef},
     r_ambient = Float64[]
 
     solar_nodes = Int[]
-    alpha_solar = Float64[]
+    alpha_solar = Matrix{Float64}(undef, 0, SOLAR_PROFILE_LENGTH)
 
     hvac_nodes = Int[]
 
@@ -145,7 +161,7 @@ function BuildingGraphModel(zones::Vector{ZoneDef}, walls::Vector{WallDef},
         # Solar
         if z.has_solar
             push!(solar_nodes, mass_node)
-            push!(alpha_solar, z.α)
+            alpha_solar = vcat(alpha_solar, reshape(z.α, 1, SOLAR_PROFILE_LENGTH))
         end
 
         # HVAC and internal gains
@@ -169,9 +185,9 @@ function BuildingGraphModel(zones::Vector{ZoneDef}, walls::Vector{WallDef},
         end
 
         # Solar on side a
-        if w.α_a > 0.0
+        if any(!iszero, w.α_a)
             push!(solar_nodes, w_nodes[1])
-            push!(alpha_solar, w.α_a)
+            alpha_solar = vcat(alpha_solar, reshape(w.α_a, 1, SOLAR_PROFILE_LENGTH))
         end
 
         # Internal wall nodes
@@ -192,9 +208,9 @@ function BuildingGraphModel(zones::Vector{ZoneDef}, walls::Vector{WallDef},
         end
 
         # Solar on side b
-        if w.α_b > 0.0
+        if any(!iszero, w.α_b)
             push!(solar_nodes, w_nodes[K])
-            push!(alpha_solar, w.α_b)
+            alpha_solar = vcat(alpha_solar, reshape(w.α_b, 1, SOLAR_PROFILE_LENGTH))
         end
     end
 
@@ -241,17 +257,37 @@ end
     end
 end
 
-# In-place right-hand side shared by the callable struct and the `ODEFunction`
-# wrapper below.  The model is a linear RC network, so the state Jacobian and
-# the parameter Jacobian are computed analytically (see `_jac!`/`_paramjac!`).
-# `p` holds the parameters in LOG-SPACE (`exp.(p.X)` recovers the absolute
-# values); `model.params` stores the absolute values, and `train!` performs the
-# mapping.
+# Hour-of-day lookup for the solar-gain profile: the 24 hourly knots live at
+# hours 0..23 and the profile repeats with period 24 h.
+@inline function _solar_hour(t)
+    tod = mod(t, 24.0)
+    h = floor(Int, tod)
+    frac = tod - h
+    return h, mod(h + 1, SOLAR_PROFILE_LENGTH), frac
+end
+
+# Periodic piecewise-linear interpolation of an hourly solar-gain profile row
+# (knots at hours 0..23, wrapping across the day boundary).
+@inline function _solar_coeff_interp(α, i, t)
+    h0, h1, frac = _solar_hour(t)
+    @inbounds return α[i, h0 + 1] * (1.0 - frac) + α[i, h1 + 1] * frac
+end
+
+# Absolute heat-gain coefficient from a LOG-space profile (`α_log` holds
+# log-coefficients; the interpolated log value is exponentiated).
+@inline _solar_coefficient(α_log, i, t) = exp(_solar_coeff_interp(α_log, i, t))
+
+# Absolute heat-gain coefficient from an ABSOLUTE-space profile (no `exp`).
+@inline _solar_coefficient_abs(α_abs, i, t) = _solar_coeff_interp(α_abs, i, t)
+
+# In-place right-hand side in LOG-space.  `p` holds parameters in log-space
+# (`exp.(p.X)` recovers the absolute values); `model.params` stores the absolute
+# values and `train!` performs the mapping.
 #
 # Sign convention: `Q_hvac > 0` and `Q_int > 0` add heat to the zone air node
 # (raise its temperature).  Cooling must therefore be supplied as a negative
 # `Q_hvac`; the units of `Q_hvac`, `Q_int` and the model capacitances must agree.
-@inline function _rhs!(du, u, p, t, m::BuildingGraphModel)
+@inline function _rhs_log!(du, u, p, t, m::BuildingGraphModel)
     t_oa = m.T_oa(t)
     i_solar = m.I_solar(t)
 
@@ -262,7 +298,7 @@ end
     end
 
     @inbounds for (i, k) in enumerate(m.solar_nodes)
-        du[k] += i_solar * exp(p.α_solar[i])
+        du[k] += i_solar * _solar_coefficient(p.α_solar, i, t)
     end
 
     @inbounds for (i, k) in enumerate(m.hvac_nodes)
@@ -284,14 +320,58 @@ end
     return nothing
 end
 
+# In-place right-hand side in ABSOLUTE space: `p` holds physical parameter values
+# directly, with no per-step `exp`.  This is the cheaper forward-simulation form
+# (used e.g. in MPC loops) and can also be selected for training via
+# `train!(...; log_space = false)`.
+@inline function _rhs_abs!(du, u, p, t, m::BuildingGraphModel)
+    t_oa = m.T_oa(t)
+    i_solar = m.I_solar(t)
+
+    du .= 0.0
+
+    @inbounds for (i, k) in enumerate(m.ambient_nodes)
+        du[k] += (t_oa - u[k]) * p.R_ambient[i]
+    end
+
+    @inbounds for (i, k) in enumerate(m.solar_nodes)
+        du[k] += i_solar * _solar_coefficient_abs(p.α_solar, i, t)
+    end
+
+    @inbounds for (i, k) in enumerate(m.hvac_nodes)
+        occ = _occupancy(t, m.occ_start[i], m.occ_end[i])
+        q_int = p.Q_int_occ[i] * occ + p.Q_int_unocc[i] * (1.0 - occ)
+        du[k] += m.Q_hvac[i](t) + q_int
+    end
+
+    @inbounds for i in eachindex(m.edge_src)
+        g = p.R_internal[i]
+        du[m.edge_dst[i]] += (u[m.edge_src[i]] - u[m.edge_dst[i]]) * g
+        du[m.edge_src[i]] += (u[m.edge_dst[i]] - u[m.edge_src[i]]) * g
+    end
+
+    @inbounds for i in eachindex(du)
+        du[i] *= p.C[i]
+    end
+
+    return nothing
+end
+
+# Compile-time parameterization dispatch for the right-hand side.
+@inline _rhs!(du, u, p, t, m::BuildingGraphModel, ::Val{true}) = _rhs_log!(du, u, p, t, m)
+@inline _rhs!(du, u, p, t, m::BuildingGraphModel, ::Val{false}) = _rhs_abs!(du, u, p, t, m)
+
+# The callable struct is a log-space convenience for interactive use; the
+# parameterization for an `ODEProblem` is chosen at `_odef`/`train!` construction
+# time instead (so the struct needs no parameterization type parameter).
 function (m::BuildingGraphModel)(du, u, p, t)
-    _rhs!(du, u, p, t, m)
+    _rhs_log!(du, u, p, t, m)
 end
 
 # Analytical state Jacobian ∂f/∂u for the linear RC model.  The Jacobian is
 # independent of `u` (and of `t`), and only depends on the conductance/capacitance
 # parameters `p`.
-@inline function _jac!(J, u, p, t, m::BuildingGraphModel)
+@inline function _jac_log!(J, u, p, t, m::BuildingGraphModel)
     fill!(J, 0.0)
     n = m.num_nodes
 
@@ -322,18 +402,56 @@ end
     return nothing
 end
 
-# Analytical parameter Jacobian ∂f/∂p.  `offC`, `offRi`, `offRa`, `offAs`,
-# `offQo`, `offQu` are the 1-based column offsets of each parameter block in the
-# flat `ComponentArray` data vector (C, R_internal, R_ambient, α_solar,
-# Q_int_occ, Q_int_unocc).
-@inline function _paramjac!(pJ, u, p, t, m::BuildingGraphModel,
-                            scratch, offC, offRi, offRa, offAs, offQo, offQu)
+# Absolute-space state Jacobian: identical structure to `_jac_log!` but with
+# `p.C`/`p.R_*` used directly (no `exp`).
+@inline function _jac_abs!(J, u, p, t, m::BuildingGraphModel)
+    fill!(J, 0.0)
+    n = m.num_nodes
+
+    @inbounds begin
+        for (i, k) in enumerate(m.ambient_nodes)
+            J[k, k] -= p.R_ambient[i]
+        end
+
+        for i in eachindex(m.edge_src)
+            g = p.R_internal[i]
+            s = m.edge_src[i]
+            d = m.edge_dst[i]
+            J[d, d] -= g
+            J[s, s] -= g
+            J[d, s] += g
+            J[s, d] += g
+        end
+
+        for i in 1:n
+            ci = p.C[i]
+            for j in 1:n
+                J[i, j] *= ci
+            end
+        end
+    end
+
+    return nothing
+end
+
+@inline _jac!(J, u, p, t, m::BuildingGraphModel, ::Val{true}) = _jac_log!(J, u, p, t, m)
+@inline _jac!(J, u, p, t, m::BuildingGraphModel, ::Val{false}) = _jac_abs!(J, u, p, t, m)
+
+# Analytical parameter Jacobian ∂f/∂p in LOG-space.  `offC`, `offRi`, `offRa`,
+# `offAs`, `offQo`, `offQu` are the 1-based column offsets of each parameter
+# block in the flat `ComponentArray` data vector (C, R_internal, R_ambient,
+# α_solar, Q_int_occ, Q_int_unocc).  `α_solar` is an n_solar × 24 matrix laid
+# out column-major in the flat vector, so column (i, h) sits at
+# `offAs + (i - 1) + h * n_solar` (h is 0-based).
+@inline function _paramjac_log!(pJ, u, p, t, m::BuildingGraphModel,
+                                scratch, offC, offRi, offRa, offAs, offQo, offQu)
     fill!(pJ, 0.0)
     db = scratch
     fill!(db, 0.0)
 
     t_oa = m.T_oa(t)
     i_solar = m.I_solar(t)
+    n_solar = length(m.solar_nodes)
 
     @inbounds begin
         # Unscaled RHS, before the final per-node `* exp(p.C)` scaling.
@@ -341,7 +459,7 @@ end
             db[k] += (t_oa - u[k]) * exp(p.R_ambient[i])
         end
         for (i, k) in enumerate(m.solar_nodes)
-            db[k] += i_solar * exp(p.α_solar[i])
+            db[k] += i_solar * _solar_coefficient(p.α_solar, i, t)
         end
         for (i, k) in enumerate(m.hvac_nodes)
             occ = _occupancy(t, m.occ_start[i], m.occ_end[i])
@@ -364,8 +482,13 @@ end
         for (i, k) in enumerate(m.ambient_nodes)
             pJ[k, offRa + i - 1] = (t_oa - u[k]) * exp(p.R_ambient[i]) * exp(p.C[k])
         end
+        # ∂/∂(log α_solar[i, h]) = I_solar * α(t) * hat_h(t) * exp(C_k), where
+        # hat_h is the piecewise-linear interpolation basis for hour h.
         for (i, k) in enumerate(m.solar_nodes)
-            pJ[k, offAs + i - 1] = i_solar * exp(p.α_solar[i]) * exp(p.C[k])
+            h0, h1, frac = _solar_hour(t)
+            α = _solar_coefficient(p.α_solar, i, t)
+            pJ[k, offAs + (i - 1) + h0 * n_solar] = i_solar * α * (1.0 - frac) * exp(p.C[k])
+            pJ[k, offAs + (i - 1) + h1 * n_solar] = i_solar * α * frac * exp(p.C[k])
         end
         for i in eachindex(m.edge_src)
             g = exp(p.R_internal[i])
@@ -384,10 +507,85 @@ end
     return nothing
 end
 
+# Analytical parameter Jacobian ∂f/∂p in ABSOLUTE space (same layout as above,
+# but with the chain-rule `exp` factors dropped).
+@inline function _paramjac_abs!(pJ, u, p, t, m::BuildingGraphModel,
+                                scratch, offC, offRi, offRa, offAs, offQo, offQu)
+    fill!(pJ, 0.0)
+    db = scratch
+    fill!(db, 0.0)
+
+    t_oa = m.T_oa(t)
+    i_solar = m.I_solar(t)
+    n_solar = length(m.solar_nodes)
+
+    @inbounds begin
+        # Unscaled RHS, before the final per-node `* p.C` scaling.
+        for (i, k) in enumerate(m.ambient_nodes)
+            db[k] += (t_oa - u[k]) * p.R_ambient[i]
+        end
+        for (i, k) in enumerate(m.solar_nodes)
+            db[k] += i_solar * _solar_coefficient_abs(p.α_solar, i, t)
+        end
+        for (i, k) in enumerate(m.hvac_nodes)
+            occ = _occupancy(t, m.occ_start[i], m.occ_end[i])
+            db[k] += m.Q_hvac[i](t) + p.Q_int_occ[i] * occ +
+                     p.Q_int_unocc[i] * (1.0 - occ)
+        end
+        for i in eachindex(m.edge_src)
+            g = p.R_internal[i]
+            s = m.edge_src[i]
+            d = m.edge_dst[i]
+            db[d] += (u[s] - u[d]) * g
+            db[s] += (u[d] - u[s]) * g
+        end
+
+        # ∂/∂C_k of `db_k * C_k` is `db_k`.
+        for k in 1:m.num_nodes
+            pJ[k, offC + k - 1] = db[k]
+        end
+
+        for (i, k) in enumerate(m.ambient_nodes)
+            pJ[k, offRa + i - 1] = (t_oa - u[k]) * p.C[k]
+        end
+        # ∂/∂α_solar[i, h] = I_solar * hat_h(t) * C_k.
+        for (i, k) in enumerate(m.solar_nodes)
+            h0, h1, frac = _solar_hour(t)
+            pJ[k, offAs + (i - 1) + h0 * n_solar] = i_solar * (1.0 - frac) * p.C[k]
+            pJ[k, offAs + (i - 1) + h1 * n_solar] = i_solar * frac * p.C[k]
+        end
+        for i in eachindex(m.edge_src)
+            s = m.edge_src[i]
+            d = m.edge_dst[i]
+            pJ[d, offRi + i - 1] = (u[s] - u[d]) * p.C[d]
+            pJ[s, offRi + i - 1] = (u[d] - u[s]) * p.C[s]
+        end
+        for (i, k) in enumerate(m.hvac_nodes)
+            occ = _occupancy(t, m.occ_start[i], m.occ_end[i])
+            pJ[k, offQo + i - 1] = occ * p.C[k]
+            pJ[k, offQu + i - 1] = (1.0 - occ) * p.C[k]
+        end
+    end
+
+    return nothing
+end
+
+@inline function _paramjac!(pJ, u, p, t, m::BuildingGraphModel,
+                            scratch, offC, offRi, offRa, offAs, offQo, offQu,
+                            ::Val{true})
+    _paramjac_log!(pJ, u, p, t, m, scratch, offC, offRi, offRa, offAs, offQo, offQu)
+end
+@inline function _paramjac!(pJ, u, p, t, m::BuildingGraphModel,
+                            scratch, offC, offRi, offRa, offAs, offQo, offQu,
+                            ::Val{false})
+    _paramjac_abs!(pJ, u, p, t, m, scratch, offC, offRi, offRa, offAs, offQo, offQu)
+end
+
 # Build an `ODEFunction` with analytical state/parameter Jacobians so that
 # implicit solvers and `InterpolatingAdjoint(autojacvec = false)` can avoid
-# automatic differentiation of the right-hand side altogether.
-function _odef(m::BuildingGraphModel)
+# automatic differentiation of the right-hand side altogether.  `log_space`
+# selects the parameterization used by `p` (true: log-space, false: absolute).
+function _odef(m::BuildingGraphModel; log_space::Bool = true)
     n = m.num_nodes
     nC = length(m.params.C)
     nRi = length(m.params.R_internal)
@@ -407,14 +605,101 @@ function _odef(m::BuildingGraphModel)
     offQu = offQo + nQo
 
     scratch = Vector{Float64}(undef, n)
+    ls = Val(log_space)
 
-    f = (du, u, p, t) -> _rhs!(du, u, p, t, m)
-    jac = (J, u, p, t) -> _jac!(J, u, p, t, m)
+    f = (du, u, p, t) -> _rhs!(du, u, p, t, m, ls)
+    jac = (J, u, p, t) -> _jac!(J, u, p, t, m, ls)
     paramjac = (pJ, u, p, t) -> _paramjac!(pJ, u, p, t, m, scratch,
-                                           offC, offRi, offRa, offAs, offQo, offQu)
+                                           offC, offRi, offRa, offAs, offQo, offQu, ls)
 
     return ODEFunction{true}(f; jac = jac, paramjac = paramjac,
                              jac_prototype = zeros(n, n))
+end
+
+# -----------------------------------------------------------------------------
+# Forward (non-training) simulation.  For MPC we rebuild the ODE problem every
+# loop with fresh weather/HVAC forecasts, so the exogenous inputs are passed
+# through `p` rather than closed over in the model struct.  Only the topology
+# (node lists, edges, occupancy schedule) is reused from `m`.
+# -----------------------------------------------------------------------------
+
+"""
+    Exogenous(T_oa, I_solar, Q_hvac)
+
+Bundle of known time-varying inputs carried through `p` for forward simulation.
+`T_oa`/`I_solar` are outdoor temperature / solar irradiance callables and
+`Q_hvac` is a tuple of per-zone HVAC-load callables.
+"""
+struct Exogenous{T_OA, T_SOL, T_HVAC}
+    T_oa::T_OA
+    I_solar::T_SOL
+    Q_hvac::T_HVAC
+end
+
+# Absolute-space right-hand side reading parameters and exogenous inputs from
+# `p = (; params, exo)` (a NamedTuple).  No `exp`, and no reliance on the
+# interpolators stored in `m`.
+@inline function _rhs_forward!(du, u, p, t, m::BuildingGraphModel)
+    prm = p.params
+    exo = p.exo
+    t_oa = exo.T_oa(t)
+    i_solar = exo.I_solar(t)
+
+    du .= 0.0
+
+    @inbounds for (i, k) in enumerate(m.ambient_nodes)
+        du[k] += (t_oa - u[k]) * prm.R_ambient[i]
+    end
+
+    @inbounds for (i, k) in enumerate(m.solar_nodes)
+        du[k] += i_solar * _solar_coefficient_abs(prm.α_solar, i, t)
+    end
+
+    @inbounds for (i, k) in enumerate(m.hvac_nodes)
+        occ = _occupancy(t, m.occ_start[i], m.occ_end[i])
+        q_int = prm.Q_int_occ[i] * occ + prm.Q_int_unocc[i] * (1.0 - occ)
+        du[k] += exo.Q_hvac[i](t) + q_int
+    end
+
+    @inbounds for i in eachindex(m.edge_src)
+        g = prm.R_internal[i]
+        du[m.edge_dst[i]] += (u[m.edge_src[i]] - u[m.edge_dst[i]]) * g
+        du[m.edge_src[i]] += (u[m.edge_dst[i]] - u[m.edge_src[i]]) * g
+    end
+
+    @inbounds for i in eachindex(du)
+        du[i] *= prm.C[i]
+    end
+
+    return nothing
+end
+
+"""
+    make_forward_odefun(m::BuildingGraphModel) -> ODEFunction
+
+Build an `ODEFunction` for pure forward simulation.  Its `p` must be
+`(; params, exo)` with `params` in **absolute** units and `exo` an
+[`Exogenous`](@ref).  The state Jacobian is supplied analytically; no parameter
+Jacobian is provided (forward simulation does not differentiate `p`).
+"""
+function make_forward_odefun(m::BuildingGraphModel)
+    f = (du, u, p, t) -> _rhs_forward!(du, u, p, t, m)
+    jac = (J, u, p, t) -> _jac_abs!(J, u, p.params, t, m)
+    return ODEFunction{true}(f; jac = jac,
+                             jac_prototype = zeros(m.num_nodes, m.num_nodes))
+end
+
+"""
+    make_forward_problem(m, u0, tspan, params_abs, T_oa, I_solar, Q_hvac) -> ODEProblem
+
+Build a forward-simulation `ODEProblem` whose `p` carries the (absolute) model
+parameters and the exogenous inputs.  Reuse this with fresh forecasts in each
+MPC iteration without rebuilding the model struct.
+"""
+function make_forward_problem(m::BuildingGraphModel, u0, tspan, params_abs,
+                              T_oa, I_solar, Q_hvac)
+    p = (; params = params_abs, exo = Exogenous(T_oa, I_solar, Q_hvac))
+    return ODEProblem(make_forward_odefun(m), u0, tspan, p)
 end
 
 # -----------------------------------------------------------------------------
@@ -579,14 +864,15 @@ end
 # Canonical method: observations as a tuple of per-node interpolators/callables.
 function air_node_residual_loss(topo::BuildingGraphModel, u0, tspan, p,
                                 T_obs::Tuple, tobs;
-                                alg = Tsit5(), reltol = 1e-8, abstol = 1e-10)
+                                alg = Tsit5(), reltol = 1e-8, abstol = 1e-10,
+                                log_space = true)
     air_idx = topo.hvac_nodes
     _check_observation_data(air_idx, T_obs)
     w, ts = _observation_weights(tobs)
 
     # Dense forward solve (no `saveat`): `saveat` disables the dense interpolant,
     # which would force the adjoint to checkpoint/re-solve forward intervals.
-    sol = solve(ODEProblem(_odef(topo), u0, tspan, p), alg;
+    sol = solve(ODEProblem(_odef(topo; log_space = log_space), u0, tspan, p), alg;
                 reltol = reltol, abstol = abstol)
     return _air_node_residual_loss(sol, air_idx, T_obs, w, ts)
 end
@@ -611,14 +897,15 @@ function air_node_residual_loss_and_gradients(topo::BuildingGraphModel, u0, tspa
                                               T_obs::Tuple, tobs;
                                               alg = Tsit5(),
                                               sensealg = InterpolatingAdjoint(autojacvec = false),
-                                              reltol = 1e-8, abstol = 1e-10)
+                                              reltol = 1e-8, abstol = 1e-10,
+                                              log_space = true)
     air_idx = topo.hvac_nodes
     _check_observation_data(air_idx, T_obs)
     w, ts = _observation_weights(tobs)
 
     # Dense forward solve (see `air_node_residual_loss`): this avoids adjoint
     # checkpointing and its large allocation overhead.
-    sol = solve(ODEProblem(_odef(topo), u0, tspan, p), alg;
+    sol = solve(ODEProblem(_odef(topo; log_space = log_space), u0, tspan, p), alg;
                 reltol = reltol, abstol = abstol)
     loss = _air_node_residual_loss(sol, air_idx, T_obs, w, ts)
     isfinite(loss) || return (Inf, zero(u0), zero(p))
@@ -664,7 +951,7 @@ air_node_residual_gradient(topo::BuildingGraphModel, u0, tspan, p, T_obs, tobs; 
 # -----------------------------------------------------------------------------
 
 """
-    train!(model::BuildingGraphModel, T_obs, tobs; kwargs...)
+    train!(model::BuildingGraphModel, T_obs, tobs; kwargs...) -> (; u0, loss, retcode)
 
 Learn the model parameters (and initial state `u0`) by minimizing the air-node
 trajectory-matching loss against observed temperatures over `[tobs[1], tobs[end]]`.
@@ -674,10 +961,12 @@ trajectory-matching loss against observed temperatures over `[tobs[1], tobs[end]
 inputs stored in `model` (`T_oa`, `I_solar`, `Q_hvac`) must cover the training
 window.
 
-The model's parameters are stored in **absolute** units.  They are mapped to
-log-space for the ODE/optimization (see `_rhs!`) and mapped back before being
-written into `model.params`.  Returns `(; u0, loss, retcode)` with the learned
-initial state in absolute units.
+The model's parameters are stored in **absolute** units.  With `log_space=true`
+(default) the optimizer works in log-space and maps back with `exp`; with
+`log_space=false` the optimizer works directly in absolute space (no per-step
+`exp` in the ODE), with positive lower bounds keeping parameters physical.
+Either way the learned values are written back into `model.params` in absolute
+units.  Returns `(; u0, loss, retcode)`.
 """
 function train!(model::BuildingGraphModel, T_obs::Tuple, tobs;
                 u0_init = nothing,
@@ -687,9 +976,10 @@ function train!(model::BuildingGraphModel, T_obs::Tuple, tobs;
                 sensealg = InterpolatingAdjoint(autojacvec = false),
                 reltol = 1e-8, abstol = 1e-10,
                 u0_lb = 40.0, u0_ub = 110.0,
-                p_lb = -10.0, p_ub = 5.0,
+                p_lb = nothing, p_ub = nothing,
                 maxeval = 400, stopval = 1e-3,
-                verbose = false)
+                verbose = false,
+                log_space = true)
     air_idx = model.hvac_nodes
     _check_observation_data(air_idx, T_obs)
     ts = sort(collect(tobs))
@@ -697,8 +987,12 @@ function train!(model::BuildingGraphModel, T_obs::Tuple, tobs;
 
     n_u = model.num_nodes
     n_p = length(model.params)
-    all(>(0.0), model.params) || throw(ArgumentError(
-        "model.params must be strictly positive (absolute units) so they can be mapped to log-space"))
+
+    if log_space
+        all(>(0.0), model.params) || throw(ArgumentError(
+            "log-space training requires strictly positive absolute parameters " *
+            "(they are mapped through `log`)"))
+    end
 
     # initial-state guess: if none given, start every node at the mean observed
     # air temperature.
@@ -716,15 +1010,23 @@ function train!(model::BuildingGraphModel, T_obs::Tuple, tobs;
     length(u0_init) == n_u || throw(DimensionMismatch(
         "u0_init must have length $(n_u) (one entry per node)"))
 
-    p_log_init = log.(model.params)
-    param_axes = getaxes(p_log_init)
-    pack(s) = ComponentArray(s, param_axes)
-
-    z0 = vcat(collect(u0_init), vec(p_log_init))
+    # Parameter initial guess in the chosen space.  The perturbation is a
+    # *relative* perturbation in both regimes (multiplicative in absolute space,
+    # additive in log-space), so it is scale-invariant.
+    p_init = log_space ? log.(model.params) : copy(model.params)
     if p_init_perturb != 0
         rng = Random.MersenneTwister(rng_seed)
-        z0[(n_u + 1):end] .+= p_init_perturb .* randn(rng, n_p)
+        if log_space
+            p_init .+= p_init_perturb .* randn(rng, n_p)
+        else
+            p_init .*= exp.(p_init_perturb .* randn(rng, n_p))
+        end
     end
+
+    param_axes = getaxes(model.params)
+    pack(s) = ComponentArray(s, param_axes)
+
+    z0 = vcat(collect(u0_init), vec(p_init))
 
     unpack_z(z) = (z[1:n_u], pack(z[(n_u + 1):end]))
 
@@ -732,7 +1034,8 @@ function train!(model::BuildingGraphModel, T_obs::Tuple, tobs;
         try
             u0v, pv = unpack_z(z)
             loss = air_node_residual_loss(model, u0v, tspan, pv, T_obs, ts;
-                                          alg = alg, reltol = reltol, abstol = abstol)
+                                          alg = alg, reltol = reltol, abstol = abstol,
+                                          log_space = log_space)
             return isfinite(loss) ? loss : 1e12
         catch
             return 1e12
@@ -744,7 +1047,8 @@ function train!(model::BuildingGraphModel, T_obs::Tuple, tobs;
             u0v, pv = unpack_z(z)
             loss, gu0, gp = air_node_residual_loss_and_gradients(
                 model, u0v, tspan, pv, T_obs, ts;
-                alg = alg, sensealg = sensealg, reltol = reltol, abstol = abstol)
+                alg = alg, sensealg = sensealg, reltol = reltol, abstol = abstol,
+                log_space = log_space)
             if isfinite(loss) && all(isfinite, vec(gu0)) && all(isfinite, vec(gp))
                 G[1:n_u] .= vec(gu0)
                 G[(n_u + 1):end] .= vec(gp)
@@ -763,7 +1067,8 @@ function train!(model::BuildingGraphModel, T_obs::Tuple, tobs;
             u0v, pv = unpack_z(z)
             loss, gu0, gp = air_node_residual_loss_and_gradients(
                 model, u0v, tspan, pv, T_obs, ts;
-                alg = alg, sensealg = sensealg, reltol = reltol, abstol = abstol)
+                alg = alg, sensealg = sensealg, reltol = reltol, abstol = abstol,
+                log_space = log_space)
         catch
             G !== nothing && fill!(G, 0.0)
             return 1e12
@@ -781,9 +1086,13 @@ function train!(model::BuildingGraphModel, T_obs::Tuple, tobs;
         end
     end
 
+    # Parameter bounds, interpreted in the chosen space.
+    _p_lb = p_lb === nothing ? (log_space ? -10.0 : 1e-8) : p_lb
+    _p_ub = p_ub === nothing ? (log_space ? 5.0 : 1e4) : p_ub
+
     optf = OptimizationFunction(objective, Optimization.NoAD(); grad = grad!, fg = fg!)
-    lb = vcat(fill(u0_lb, n_u), fill(p_lb, n_p))
-    ub = vcat(fill(u0_ub, n_u), fill(p_ub, n_p))
+    lb = vcat(fill(u0_lb, n_u), fill(_p_lb, n_p))
+    ub = vcat(fill(u0_ub, n_u), fill(_p_ub, n_p))
     optprob = OptimizationProblem(optf, z0, nothing; lb = lb, ub = ub)
 
     nlopt_alg = NLopt.Opt(:LD_LBFGS, length(z0))
@@ -792,11 +1101,11 @@ function train!(model::BuildingGraphModel, T_obs::Tuple, tobs;
 
     opt_sol = solve(optprob, nlopt_alg; verbose = verbose)
 
-    u0_rec    = opt_sol.u[1:n_u]
-    p_log_rec = pack(opt_sol.u[(n_u + 1):end])
+    u0_rec = opt_sol.u[1:n_u]
+    p_rec  = pack(opt_sol.u[(n_u + 1):end])
 
     # store learned parameters in the model, in absolute units
-    model.params .= exp.(p_log_rec)
+    model.params .= log_space ? exp.(p_rec) : p_rec
 
     return (; u0 = u0_rec, loss = objective(opt_sol.u, nothing),
             retcode = opt_sol.retcode)
@@ -833,11 +1142,24 @@ c1InteriorWall = 1 / (z1InteriorWallft3 * densityBrick * spBrick / 12000.0)
 c2Air = 1 / (z2sqft * floorToRoof * densityAir * spAir / 12000.0)
 c2Brick = 1 / (z2ExteriorWallft3 * densityBrick * spBrick / 12000.0)
 
-z1 = ZoneDef(:z1; cAir = c1Air, cMass = c1Air / 5.0, rAirAm = 0.25, rAirMass = 0.1, α = 0.01)
+# Hourly solar-gain profiles.  The true coefficients vary over the day (a
+# midday peak for the zone mass, a morning peak for the east exterior wall).
+# Night hours use a tiny positive floor because parameters are stored/log-mapped
+# in log-space (which cannot represent an exact zero).
+_day_solar_profile = [1e-4, 1e-4, 1e-4, 1e-4, 1e-4, 1e-4,
+                      0.002, 0.005, 0.010, 0.015, 0.020, 0.024,
+                      0.025, 0.024, 0.020, 0.015, 0.010, 0.005,
+                      0.002, 1e-4, 1e-4, 1e-4, 1e-4, 1e-4]
+_morning_solar_profile = [1e-4, 1e-4, 1e-4, 1e-4, 1e-4, 1e-4,
+                          0.008, 0.020, 0.030, 0.025, 0.015, 0.008,
+                          0.002, 1e-4, 1e-4, 1e-4, 1e-4, 1e-4,
+                          1e-4, 1e-4, 1e-4, 1e-4, 1e-4, 1e-4]
+
+z1 = ZoneDef(:z1; cAir = c1Air, cMass = c1Air / 5.0, rAirAm = 0.25, rAirMass = 0.1, α = _day_solar_profile)
 z2 = ZoneDef(:z2; cAir = c2Air, cMass = c2Air / 5.0, rAirAm = 0.25, rAirMass = 0.1, α = 0.0)
 
 w1 = WallDef(:w1, :z1, :z2, 2; c = [c1InteriorWall * 2.0, c1InteriorWall * 2.0], r = [0.1, 0.1, 0.1], α_a = 0.0, α_b = 0.0)
-w2 = WallDef(:w2, :z1, :ambient, 2; c = [c1Brick * 2.0, c1Brick * 2.0], r = [1.0, 1.0, 1.0], α_a = 0.0, α_b = 0.0)
+w2 = WallDef(:w2, :z1, :ambient, 2; c = [c1Brick * 2.0, c1Brick * 2.0], r = [1.0, 1.0, 1.0], α_a = _morning_solar_profile, α_b = 0.0)
 w3 = WallDef(:w3, :z2, :ambient, 2; c = [c2Brick * 2.0, c2Brick * 2.0], r = [1.0, 1.0, 1.0], α_a = 0.0, α_b = 0.0)
 
 # 72 hours of synthetic data
@@ -948,14 +1270,27 @@ println("relative L2 error (u0)    = ", round(norm(vec(g_u0_adj) - g_u0_fwd) / n
 # -----------------------------------------------------------------------------
 Random.seed!(1)
 topo_learned = deepcopy(topo)
-topo_learned.params .= p_abs_true .* exp.(0.5 .* randn(length(p_abs_true)))   # initial guess
-
-topo.params
-topo_learned.params
+topo_learned.params .= p_abs_true .* exp.(0.2 .* randn(length(p_abs_true)))   # initial guess
 
 @time result = train!(topo_learned, T_obs, t_obs;
                       u0_init = fill(75.0, topo_learned.num_nodes),
-                      p_init_perturb = 0.0)
+                      p_init_perturb = 0.0,
+                      maxeval = 500)
 
 p_abs_rec = topo_learned.params   # learned, stored in absolute units
-result.u0
+
+println("\n=== train! (u0, p) recovery ===")
+println("retcode                 = ", result.retcode)
+println("final loss              = ", round(result.loss, sigdigits = 5))
+println("||u0 - u0_true||        = ", round(norm(result.u0 .- u0_true), sigdigits = 5))
+println("||p - p_true|| (log)    = ", round(norm(log.(p_abs_rec) - log.(p_abs_true)), sigdigits = 5))
+println("Q_int_occ recovered     = ", round.(p_abs_rec.Q_int_occ, sigdigits = 4),
+        "  (true ", round.(p_abs_true.Q_int_occ, sigdigits = 4), ")")
+println("Q_int_unocc recovered   = ", round.(p_abs_rec.Q_int_unocc, sigdigits = 4),
+        "  (true ", round.(p_abs_true.Q_int_unocc, sigdigits = 4), ")")
+
+# Report the identifiable (daytime) solar-gain profile for the first solar node.
+# Hours without solar irradiance carry no information, so those coefficients stay
+# near their initial guess.
+println("α_solar[1,:] recovered  = ", round.(p_abs_rec.α_solar[1, :], sigdigits = 3))
+println("α_solar[1,:] true       = ", round.(p_abs_true.α_solar[1, :], sigdigits = 3))
