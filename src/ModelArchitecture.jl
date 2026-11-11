@@ -1,10 +1,8 @@
+module ModelArchitecture
+
 using LinearAlgebra, ComponentArrays, DataInterpolations
-using DifferentialEquations, SciMLSensitivity
-using Optimization, OptimizationNLopt, Optim, NLopt
-using ReverseDiff, Zygote
-using ForwardDiff
+using DifferentialEquations, OrdinaryDiffEqSDIRK
 using Random
-using Gadfly
 
 #= structs =#
 
@@ -702,34 +700,35 @@ function make_forward_problem(m::BuildingGraphModel, u0, tspan, params_abs,
     return ODEProblem(make_forward_odefun(m), u0, tspan, p)
 end
 
-# -----------------------------------------------------------------------------
-# Exogenous input generation.  Weather (T_oa, I_solar) and the HVAC control
-# input (Q_hvac) are generated separately: weather is an uncontrollable external
-# disturbance, while Q_hvac is a *known* control input that we choose.  Internal
-# gains Q_int are NOT generated here — they are learned parameters (occupancy
-# coefficients) living in `BuildingGraphModel.params`.
-# -----------------------------------------------------------------------------
-
 """
-    generate_sample_weather(tspan, steps; kwargs...) -> (T_oa, I_solar)
+    simulate_forward(m::BuildingGraphModel, u0, tspan; kwargs...) -> ODESolution
 
-Synthetic outdoor-air temperature and solar irradiance, for testing before real
-OpenMeteo weather is wired in.  Returns `LinearInterpolation` objects.
+Simulate the model forward in **absolute** units and return the `ODESolution`.
+`u0` is the initial state and `tspan` the time span; `params_abs`, `T_oa`,
+`I_solar` and `Q_hvac` default to the values stored in `m` (pass fresh
+forecasts instead to reuse the same topology in an MPC loop).
+
+The ODE is solved with the stiff `KenCarp4` method by default and an analytic
+state Jacobian (see [`make_forward_odefun`](@ref)).  Any extra keyword arguments
+(`reltol`, `abstol`, `saveat`, `dtmax`, …) are forwarded to `solve`.
 """
-function generate_sample_weather(tspan, steps;
-                                 meanTemp=72.0, varTemp=10.0,
-                                 amp_mod_amp=15.0, amp_mod_phase=π,
-                                 amp_mod_freq=1/(3 * tspan[2]),
-                                 peakSolar=500.0)
-    t_steps = collect(range(tspan[1], tspan[2], length=steps))
-    T_oa_data = (meanTemp .+ (varTemp .* sin.(2π .* t_steps ./ 24.0 .- π/2))) .+
-                (amp_mod_amp .* sin.(2π .* amp_mod_freq .* t_steps .+ amp_mod_phase))
-    I_solar_data = peakSolar .* max.(0.0, sin.(2π .* t_steps ./ 24.0 .- π/2))
-
-    T_oa = LinearInterpolation(T_oa_data, t_steps)
-    I_solar = LinearInterpolation(I_solar_data, t_steps)
-    return T_oa, I_solar
+function simulate_forward(m::BuildingGraphModel, u0, tspan;
+                          params_abs = m.params,
+                          T_oa = m.T_oa,
+                          I_solar = m.I_solar,
+                          Q_hvac = m.Q_hvac,
+                          alg = KenCarp4(),
+                          kwargs...)
+    prob = make_forward_problem(m, u0, tspan, params_abs, T_oa, I_solar, Q_hvac)
+    return solve(prob, alg; kwargs...)
 end
+
+
+# -----------------------------------------------------------------------------
+# HVAC control input generation.  Q_hvac is a *known* control input chosen by
+# the user; internal gains Q_int are learned parameters living in
+# `BuildingGraphModel.params`.
+# -----------------------------------------------------------------------------
 
 """
     generate_sample_control(tspan, steps, num_zones; kwargs...) -> Q_hvac
@@ -768,6 +767,7 @@ end
 
 function update_exo_inputs(model::BuildingGraphModel, T_oa, I_solar, Q_hvac)
     return BuildingGraphModel(
+        model.num_nodes,
         model.node_names,
         model.edge_src,
         model.edge_dst,
@@ -783,514 +783,9 @@ function update_exo_inputs(model::BuildingGraphModel, T_oa, I_solar, Q_hvac)
     )
 end
 
-# -----------------------------------------------------------------------------
-# Observation handling.  Observed air-node temperatures may come from a forward
-# solve (synthetic) or from real sensors with arbitrary, irregular sampling
-# times.  In both cases they are represented as one interpolator (or callable)
-# per air node, so the loss/gradient machinery never needs the observation times
-# to align with any internally chosen grid.
-# -----------------------------------------------------------------------------
 
-"""
-    observation_interpolators(data_air, tobs) -> (T_obs, ts_sorted)
+export ZoneDef, WallDef, BuildingGraphModel, Exogenous,
+       make_forward_odefun, make_forward_problem, simulate_forward,
+       generate_sample_control, update_exo_inputs
 
-Build one `LinearInterpolation` per air node from an `n_t × n_air` matrix of
-observations sampled at `tobs`.  Returns the tuple of interpolators together
-with the sorted observation times (interpolators require sorted times).
-"""
-function observation_interpolators(data_air::AbstractMatrix, tobs)
-    n_t, n_air = size(data_air)
-    n_t == length(tobs) || throw(DimensionMismatch(
-        "data_air has $(n_t) rows but $(length(tobs)) observation times were given"))
-    p_ = sortperm(collect(tobs))
-    ts = collect(tobs)[p_]
-    T_obs = Tuple(LinearInterpolation(data_air[p_, k], ts) for k in 1:n_air)
-    return T_obs, ts
 end
-
-# -----------------------------------------------------------------------------
-# Parameter-recovery objective for the air/HVAC nodes, differentiated with
-# SciMLSensitivity.adjoint_sensitivities (interpolating/continuous adjoint).
-#
-#   loss(u0, p) = Σᵢ wᵢ Σₖ (uₖ(tᵢ) - T_obsₖ(tᵢ))² ,
-#
-# where k runs over `topo.hvac_nodes` (the zone air nodes), the `tᵢ` are the
-# (arbitrarily spaced) observation times, the `wᵢ` are trapezoidal quadrature
-# weights on those times, and `T_obsₖ` is the observed temperature of node k as
-# an interpolator or other callable.  Both the initial condition `u0` and the
-# parameter vector `p` are estimated; `p` is in log-space (see `_rhs!`).
-# -----------------------------------------------------------------------------
-
-function _air_node_quadrature_weights(tgrid)
-    n_t = length(tgrid)
-    n_t > 1 || throw(ArgumentError("tgrid must contain at least two points"))
-
-    dtv = diff(tgrid)
-    w = zeros(n_t)
-    w[1] = dtv[1] / 2
-    w[end] = dtv[end] / 2
-    for i in 2:(n_t - 1)
-        w[i] = (dtv[i - 1] + dtv[i]) / 2
-    end
-    return w
-end
-
-# Sort observation times and compute trapezoidal quadrature weights for them.
-function _observation_weights(tobs)
-    ts = sort(collect(tobs))
-    return _air_node_quadrature_weights(ts), ts
-end
-
-function _check_observation_data(air_idx, T_obs)
-    length(T_obs) == length(air_idx) || throw(DimensionMismatch(
-        "T_obs must have one interpolator per air node ($(length(air_idx))), got $(length(T_obs))"))
-    return nothing
-end
-
-function _air_node_residual_loss(sol, air_idx, T_obs, w, tobs)
-    u = zero(sol.u[1])
-    loss = 0.0
-    for (i, ti) in enumerate(tobs)
-        sol(u, ti)
-        all(isfinite, u) || return Inf
-        for (k, idx) in enumerate(air_idx)
-            r = u[idx] - T_obs[k](ti)
-            loss += w[i] * r * r
-        end
-    end
-    return loss
-end
-
-# Canonical method: observations as a tuple of per-node interpolators/callables.
-function air_node_residual_loss(topo::BuildingGraphModel, u0, tspan, p,
-                                T_obs::Tuple, tobs;
-                                alg = Tsit5(), reltol = 1e-8, abstol = 1e-10,
-                                log_space = true)
-    air_idx = topo.hvac_nodes
-    _check_observation_data(air_idx, T_obs)
-    w, ts = _observation_weights(tobs)
-
-    # Dense forward solve (no `saveat`): `saveat` disables the dense interpolant,
-    # which would force the adjoint to checkpoint/re-solve forward intervals.
-    sol = solve(ODEProblem(_odef(topo; log_space = log_space), u0, tspan, p), alg;
-                reltol = reltol, abstol = abstol)
-    return _air_node_residual_loss(sol, air_idx, T_obs, w, ts)
-end
-
-# Convenience method: observations as an (n_t × n_air) matrix aligned with `tobs`.
-function air_node_residual_loss(topo::BuildingGraphModel, u0, tspan, p,
-                                data_air::AbstractMatrix, tobs;
-                                kwargs...)
-    T_obs, ts = observation_interpolators(data_air, tobs)
-    return air_node_residual_loss(topo, u0, tspan, p, T_obs, ts; kwargs...)
-end
-
-"""
-    air_node_residual_loss_and_gradients(topo, u0, tspan, p, T_obs, tobs; kwargs...)
-
-Returns `(loss, du0, dp)` where `du0 = ∂loss/∂u0` and `dp = ∂loss/∂p`, both
-computed with one forward + adjoint solve.  `T_obs` is a tuple of per-air-node
-observation interpolators (or callables) and `tobs` are the (arbitrary)
-observation times.  This is the entry point for joint `(u0, p)` estimation.
-"""
-function air_node_residual_loss_and_gradients(topo::BuildingGraphModel, u0, tspan, p,
-                                              T_obs::Tuple, tobs;
-                                              alg = Tsit5(),
-                                              sensealg = InterpolatingAdjoint(autojacvec = false),
-                                              reltol = 1e-8, abstol = 1e-10,
-                                              log_space = true)
-    air_idx = topo.hvac_nodes
-    _check_observation_data(air_idx, T_obs)
-    w, ts = _observation_weights(tobs)
-
-    # Dense forward solve (see `air_node_residual_loss`): this avoids adjoint
-    # checkpointing and its large allocation overhead.
-    sol = solve(ODEProblem(_odef(topo; log_space = log_space), u0, tspan, p), alg;
-                reltol = reltol, abstol = abstol)
-    loss = _air_node_residual_loss(sol, air_idx, T_obs, w, ts)
-    isfinite(loss) || return (Inf, zero(u0), zero(p))
-
-    # discrete cost gradient at each data time: ∂/∂u [wᵢ ‖u_air − T_obs(tᵢ)‖²]
-    function dgdu_discrete(out, u, p_, t, i)
-        fill!(out, 0.0)
-        for (k, idx) in enumerate(air_idx)
-            out[idx] = 2 * w[i] * (u[idx] - T_obs[k](t))
-        end
-        nothing
-    end
-
-    du0, dp = adjoint_sensitivities(sol, alg; t = ts, dgdu_discrete = dgdu_discrete,
-                                    sensealg = sensealg, reltol = reltol, abstol = abstol)
-
-    grad_u0 = u0 isa ComponentArray ? ComponentArray(vec(du0), getaxes(u0)) : vec(du0)
-    grad_p  = p  isa ComponentArray ? ComponentArray(vec(dp),  getaxes(p))  : vec(dp)
-    return loss, grad_u0, grad_p
-end
-
-function air_node_residual_loss_and_gradients(topo::BuildingGraphModel, u0, tspan, p,
-                                              data_air::AbstractMatrix, tobs;
-                                              kwargs...)
-    T_obs, ts = observation_interpolators(data_air, tobs)
-    return air_node_residual_loss_and_gradients(topo, u0, tspan, p, T_obs, ts; kwargs...)
-end
-
-function air_node_residual_loss_and_gradient(topo::BuildingGraphModel, u0, tspan, p,
-                                             T_obs, tobs;
-                                             kwargs...)
-    loss, _, grad_p = air_node_residual_loss_and_gradients(
-        topo, u0, tspan, p, T_obs, tobs; kwargs...)
-    return loss, grad_p
-end
-
-air_node_residual_gradient(topo::BuildingGraphModel, u0, tspan, p, T_obs, tobs; kwargs...) =
-    air_node_residual_loss_and_gradient(topo, u0, tspan, p, T_obs, tobs; kwargs...)[2]
-
-# -----------------------------------------------------------------------------
-# Training interface: learn (u0, p) from measured air-node temperatures and
-# store the learned parameters back into the model in absolute units.
-# -----------------------------------------------------------------------------
-
-"""
-    train!(model::BuildingGraphModel, T_obs, tobs; kwargs...) -> (; u0, loss, retcode)
-
-Learn the model parameters (and initial state `u0`) by minimizing the air-node
-trajectory-matching loss against observed temperatures over `[tobs[1], tobs[end]]`.
-
-`T_obs` is a tuple of per-air-node observation interpolators (or an
-`n_t × n_air` matrix of observations aligned with `tobs`).  The exogenous
-inputs stored in `model` (`T_oa`, `I_solar`, `Q_hvac`) must cover the training
-window.
-
-The model's parameters are stored in **absolute** units.  With `log_space=true`
-(default) the optimizer works in log-space and maps back with `exp`; with
-`log_space=false` the optimizer works directly in absolute space (no per-step
-`exp` in the ODE), with positive lower bounds keeping parameters physical.
-Either way the learned values are written back into `model.params` in absolute
-units.  Returns `(; u0, loss, retcode)`.
-"""
-function train!(model::BuildingGraphModel, T_obs::Tuple, tobs;
-                u0_init = nothing,
-                p_init_perturb = 0.2,
-                rng_seed = 1,
-                alg = Tsit5(),
-                sensealg = InterpolatingAdjoint(autojacvec = false),
-                reltol = 1e-8, abstol = 1e-10,
-                u0_lb = 40.0, u0_ub = 110.0,
-                p_lb = nothing, p_ub = nothing,
-                maxeval = 400, stopval = 1e-3,
-                verbose = false,
-                log_space = true)
-    air_idx = model.hvac_nodes
-    _check_observation_data(air_idx, T_obs)
-    ts = sort(collect(tobs))
-    tspan = (ts[1], ts[end])
-
-    n_u = model.num_nodes
-    n_p = length(model.params)
-
-    if log_space
-        all(>(0.0), model.params) || throw(ArgumentError(
-            "log-space training requires strictly positive absolute parameters " *
-            "(they are mapped through `log`)"))
-    end
-
-    # initial-state guess: if none given, start every node at the mean observed
-    # air temperature.
-    if u0_init === nothing
-        μ = 0.0
-        n_obs = 0
-        for k in 1:length(air_idx)
-            for t in ts
-                μ += T_obs[k](t)
-                n_obs += 1
-            end
-        end
-        u0_init = fill(μ / n_obs, n_u)
-    end
-    length(u0_init) == n_u || throw(DimensionMismatch(
-        "u0_init must have length $(n_u) (one entry per node)"))
-
-    # Parameter initial guess in the chosen space.  The perturbation is a
-    # *relative* perturbation in both regimes (multiplicative in absolute space,
-    # additive in log-space), so it is scale-invariant.
-    p_init = log_space ? log.(model.params) : copy(model.params)
-    if p_init_perturb != 0
-        rng = Random.MersenneTwister(rng_seed)
-        if log_space
-            p_init .+= p_init_perturb .* randn(rng, n_p)
-        else
-            p_init .*= exp.(p_init_perturb .* randn(rng, n_p))
-        end
-    end
-
-    param_axes = getaxes(model.params)
-    pack(s) = ComponentArray(s, param_axes)
-
-    z0 = vcat(collect(u0_init), vec(p_init))
-
-    unpack_z(z) = (z[1:n_u], pack(z[(n_u + 1):end]))
-
-    function objective(z, _)
-        try
-            u0v, pv = unpack_z(z)
-            loss = air_node_residual_loss(model, u0v, tspan, pv, T_obs, ts;
-                                          alg = alg, reltol = reltol, abstol = abstol,
-                                          log_space = log_space)
-            return isfinite(loss) ? loss : 1e12
-        catch
-            return 1e12
-        end
-    end
-
-    function grad!(G, z, _)
-        try
-            u0v, pv = unpack_z(z)
-            loss, gu0, gp = air_node_residual_loss_and_gradients(
-                model, u0v, tspan, pv, T_obs, ts;
-                alg = alg, sensealg = sensealg, reltol = reltol, abstol = abstol,
-                log_space = log_space)
-            if isfinite(loss) && all(isfinite, vec(gu0)) && all(isfinite, vec(gp))
-                G[1:n_u] .= vec(gu0)
-                G[(n_u + 1):end] .= vec(gp)
-            else
-                fill!(G, 0.0)
-            end
-        catch
-            fill!(G, 0.0)
-        end
-        return nothing
-    end
-
-    function fg!(G, z, _)
-        local loss, gu0, gp
-        try
-            u0v, pv = unpack_z(z)
-            loss, gu0, gp = air_node_residual_loss_and_gradients(
-                model, u0v, tspan, pv, T_obs, ts;
-                alg = alg, sensealg = sensealg, reltol = reltol, abstol = abstol,
-                log_space = log_space)
-        catch
-            G !== nothing && fill!(G, 0.0)
-            return 1e12
-        end
-
-        if isfinite(loss) && all(isfinite, vec(gu0)) && all(isfinite, vec(gp))
-            if G !== nothing
-                G[1:n_u] .= vec(gu0)
-                G[(n_u + 1):end] .= vec(gp)
-            end
-            return loss
-        else
-            G !== nothing && fill!(G, 0.0)
-            return 1e12
-        end
-    end
-
-    # Parameter bounds, interpreted in the chosen space.
-    _p_lb = p_lb === nothing ? (log_space ? -10.0 : 1e-8) : p_lb
-    _p_ub = p_ub === nothing ? (log_space ? 5.0 : 1e4) : p_ub
-
-    optf = OptimizationFunction(objective, Optimization.NoAD(); grad = grad!, fg = fg!)
-    lb = vcat(fill(u0_lb, n_u), fill(_p_lb, n_p))
-    ub = vcat(fill(u0_ub, n_u), fill(_p_ub, n_p))
-    optprob = OptimizationProblem(optf, z0, nothing; lb = lb, ub = ub)
-
-    nlopt_alg = NLopt.Opt(:LD_LBFGS, length(z0))
-    NLopt.maxeval!(nlopt_alg, maxeval)
-    NLopt.stopval!(nlopt_alg, stopval)
-
-    opt_sol = solve(optprob, nlopt_alg; verbose = verbose)
-
-    u0_rec = opt_sol.u[1:n_u]
-    p_rec  = pack(opt_sol.u[(n_u + 1):end])
-
-    # store learned parameters in the model, in absolute units
-    model.params .= log_space ? exp.(p_rec) : p_rec
-
-    return (; u0 = u0_rec, loss = objective(opt_sol.u, nothing),
-            retcode = opt_sol.retcode)
-end
-
-# Convenience method: observations as an (n_t × n_air) matrix aligned with `tobs`.
-function train!(model::BuildingGraphModel, data_air::AbstractMatrix, tobs; kwargs...)
-    T_obs, ts = observation_interpolators(data_air, tobs)
-    return train!(model, T_obs, ts; kwargs...)
-end
-
-spAir = 0.24
-spBrick = 0.22
-densityAir = .075
-densityBrick = 120.0
-
-z1sqft = 5000
-z2sqft = 10000
-
-floorToRoof = 14.0
-exteriorWallThickness = 0.5
-interiorWallThickness = 0.5
-peakTonPerSqftEst = 1/500.0
-z1PeakCoolingLoad = z1sqft * peakTonPerSqftEst 
-z2PeakCoolingLoad = z2sqft * peakTonPerSqftEst
-
-z1ExteriorWallft3 = (sqrt(z1sqft) * floorToRoof * exteriorWallThickness) * 3.0 + (sqrt(z1sqft) * exteriorWallThickness) 
-z1InteriorWallft3 = (sqrt(z1sqft) * floorToRoof * interiorWallThickness) 
-z2ExteriorWallft3 = (sqrt(z2sqft) * floorToRoof * exteriorWallThickness) * 3.0 + (sqrt(z2sqft) * exteriorWallThickness)
-
-c1Air = 1 / (z1sqft * floorToRoof * densityAir * spAir / 12000.0)
-c1Brick = 1 / (z1ExteriorWallft3 * densityBrick * spBrick / 12000.0)
-c1InteriorWall = 1 / (z1InteriorWallft3 * densityBrick * spBrick / 12000.0)
-c2Air = 1 / (z2sqft * floorToRoof * densityAir * spAir / 12000.0)
-c2Brick = 1 / (z2ExteriorWallft3 * densityBrick * spBrick / 12000.0)
-
-# Hourly solar-gain profiles.  The true coefficients vary over the day (a
-# midday peak for the zone mass, a morning peak for the east exterior wall).
-# Night hours use a tiny positive floor because parameters are stored/log-mapped
-# in log-space (which cannot represent an exact zero).
-_day_solar_profile = [1e-4, 1e-4, 1e-4, 1e-4, 1e-4, 1e-4,
-                      0.002, 0.005, 0.010, 0.015, 0.020, 0.024,
-                      0.025, 0.024, 0.020, 0.015, 0.010, 0.005,
-                      0.002, 1e-4, 1e-4, 1e-4, 1e-4, 1e-4]
-_morning_solar_profile = [1e-4, 1e-4, 1e-4, 1e-4, 1e-4, 1e-4,
-                          0.008, 0.020, 0.030, 0.025, 0.015, 0.008,
-                          0.002, 1e-4, 1e-4, 1e-4, 1e-4, 1e-4,
-                          1e-4, 1e-4, 1e-4, 1e-4, 1e-4, 1e-4]
-
-z1 = ZoneDef(:z1; cAir = c1Air, cMass = c1Air / 5.0, rAirAm = 0.25, rAirMass = 0.1, α = _day_solar_profile)
-z2 = ZoneDef(:z2; cAir = c2Air, cMass = c2Air / 5.0, rAirAm = 0.25, rAirMass = 0.1, α = 0.0)
-
-w1 = WallDef(:w1, :z1, :z2, 2; c = [c1InteriorWall * 2.0, c1InteriorWall * 2.0], r = [0.1, 0.1, 0.1], α_a = 0.0, α_b = 0.0)
-w2 = WallDef(:w2, :z1, :ambient, 2; c = [c1Brick * 2.0, c1Brick * 2.0], r = [1.0, 1.0, 1.0], α_a = _morning_solar_profile, α_b = 0.0)
-w3 = WallDef(:w3, :z2, :ambient, 2; c = [c2Brick * 2.0, c2Brick * 2.0], r = [1.0, 1.0, 1.0], α_a = 0.0, α_b = 0.0)
-
-# 72 hours of synthetic data
-t_sim = 72
-n_steps_interp = 600
-n_steps_modeled = 100
-
-t_steps = collect(range(0, t_sim, length=n_steps_modeled))
-
-n_zones = 2
-
-# occupancy schedule: each zone occupied 8:00–18:00 every day (24 h clock)
-occ_start = [8.0, 8.0]
-occ_end   = [18.0, 18.0]
-
-# Weather (uncontrolled disturbance) and HVAC control (known, open-loop) are
-# generated separately; internal gains Q_int are learned through the parameters.
-T_oa, I_solar = generate_sample_weather((0.0, t_sim), n_steps_interp;
-    meanTemp = 72.0, varTemp = 10.0, amp_mod_amp = 15.0, amp_mod_phase = π,
-    amp_mod_freq = 1/(3 * t_sim))
-Q_hvac = generate_sample_control((0.0, t_sim), n_steps_interp, n_zones;
-    amplitudes = [z1PeakCoolingLoad, z2PeakCoolingLoad])
-
-plot(layer(x = t_steps, y = [T_oa(t) for t in t_steps], Geom.line, Theme(default_color = colorant"blue")),
-     layer(x = t_steps, y = [I_solar(t) for t in t_steps], Geom.line, Theme(default_color = colorant"orange")),
-     Guide.xlabel("Time (hours)"), Guide.ylabel("Exogenous Inputs"), Guide.title("Outdoor Temperature and Solar Irradiance"))
-plot(layer(x = t_steps, y = [Q_hvac[1](t) for t in t_steps], Geom.line, Theme(default_color = colorant"blue")),
-     layer(x = t_steps, y = [Q_hvac[2](t) for t in t_steps], Geom.line, Theme(default_color = colorant"orange")),
-     Guide.xlabel("Time (hours)"), Guide.ylabel("Q_hvac (tons)"), Guide.title("Zone HVAC Control Inputs"))
-
-topo = BuildingGraphModel([z1, z2], [w1, w2, w3], T_oa, I_solar, Q_hvac, occ_start, occ_end)
-
-
-
-# initial conditions and true parameters (absolute units in `topo.params`,
-# mapped to log-space for the truth solve)
-u0_true = fill(72.0, topo.num_nodes)
-topo.params.Q_int_occ   .= [5.0, 5.0]   # true occupied internal gain per zone
-topo.params.Q_int_unocc .= [0.5, 0.5]   # true unoccupied internal gain per zone
-p_abs_true = copy(topo.params)          # absolute truth, for reporting
-p_true_log = log.(topo.params)          # log-space, for the ODE
-
-prob = ODEProblem(_odef(topo), u0_true, (0.0, t_sim), p_true_log)
-
-# Dense truth solve (no `saveat`) so it can be sampled at arbitrary times below.
-@time sol_true = solve(prob, Tsit5(), reltol = 1e-6, abstol = 1e-6)
-
-# plot the air temps (sol_true.u[1] and sol_true.u[3]) 
-
-plot(layer(x = t_steps, y = [sol_true(t)[1] for t in t_steps], Geom.line, Theme(default_color = colorant"blue")),
-     layer(x = t_steps, y = [sol_true(t)[3] for t in t_steps], Geom.line, Theme(default_color = colorant"orange")),
-     Guide.xlabel("Time (hours)"), Guide.ylabel("Zone Air Temperatures (°F)"), Guide.title("Zone Air Temperatures Over Time"))
-
-
-
-
-
-
-#=
-Model parameter recovery
-=#
-
-
-# observed air-node trajectory from the truth solve ----------------------------
-# Sample the truth solution at *irregular* times (as real sensors would produce)
-# and wrap the observations in one interpolator per air node.
-air_idx = topo.hvac_nodes
-n_air   = length(air_idx)
-
-t_obs = sort(t_steps .+ 0.19 .* sin.(3.7 .* t_steps))   # deterministic non-uniform offsets
-t_obs[1] = t_steps[1]
-t_obs[end] = t_steps[end]
-t_obs = unique(t_obs)
-
-data_air = permutedims(reduce(hcat, [sol_true(t)[air_idx] for t in t_obs]))   # n_t × n_air
-T_obs, t_obs = observation_interpolators(data_air, t_obs)
-
-# short validation window (first ~8 h of observation time)
-tchk = t_obs[t_obs .<= 8.0]
-
-# generate intial guess for parameters in log-space
-Random.seed!(1)
-p_init_log = p_true_log .+ 0.2 .* randn(length(p_true_log))
-
-
-# NB: the same interpolators are reused for the short window — no matrix slicing
-# needed, since observations are queried as T_obs[k](t).
-loss_short(u0v, pv) = air_node_residual_loss(topo, u0v, (0.0, tchk[end]), pv, T_obs, tchk;
-                                       reltol = 1e-10, abstol = 1e-12)
-
-@time _, g_u0_adj, g_p_adj = air_node_residual_loss_and_gradients(
-    topo, u0_true, (0.0, tchk[end]), p_init_log, T_obs, tchk;
-    reltol = 1e-8, abstol = 1e-8)
-@time g_p_fwd  = ForwardDiff.gradient(pv -> loss_short(u0_true, pv), p_init_log)
-@time g_u0_fwd = ForwardDiff.gradient(u0v -> loss_short(u0v, p_init_log), u0_true)
-
-println("=== adjoint_sensitivities vs ForwardDiff (short window) ===")
-println("max |g_p_adj  - g_p_fwd|  = ", round(maximum(abs.(vec(g_p_adj) .- g_p_fwd)), sigdigits=4))
-println("relative L2 error (p)     = ", round(norm(vec(g_p_adj) - g_p_fwd) / norm(g_p_fwd), sigdigits=4))
-println("max |g_u0_adj - g_u0_fwd| = ", round(maximum(abs.(vec(g_u0_adj) .- g_u0_fwd)), sigdigits=4))
-println("relative L2 error (u0)    = ", round(norm(vec(g_u0_adj) - g_u0_fwd) / norm(g_u0_fwd), sigdigits=4))
-
-
-# -----------------------------------------------------------------------------
-# Learn (u0, p) with train!.  Perturb the true parameters to form the initial
-# guess (what "a model architecture + approximate parameters" looks like), then
-# let train! store the learned absolute parameters back into `topo`.
-# -----------------------------------------------------------------------------
-Random.seed!(1)
-topo_learned = deepcopy(topo)
-topo_learned.params .= p_abs_true .* exp.(0.2 .* randn(length(p_abs_true)))   # initial guess
-
-@time result = train!(topo_learned, T_obs, t_obs;
-                      u0_init = fill(75.0, topo_learned.num_nodes),
-                      p_init_perturb = 0.0,
-                      maxeval = 500)
-
-p_abs_rec = topo_learned.params   # learned, stored in absolute units
-
-println("\n=== train! (u0, p) recovery ===")
-println("retcode                 = ", result.retcode)
-println("final loss              = ", round(result.loss, sigdigits = 5))
-println("||u0 - u0_true||        = ", round(norm(result.u0 .- u0_true), sigdigits = 5))
-println("||p - p_true|| (log)    = ", round(norm(log.(p_abs_rec) - log.(p_abs_true)), sigdigits = 5))
-println("Q_int_occ recovered     = ", round.(p_abs_rec.Q_int_occ, sigdigits = 4),
-        "  (true ", round.(p_abs_true.Q_int_occ, sigdigits = 4), ")")
-println("Q_int_unocc recovered   = ", round.(p_abs_rec.Q_int_unocc, sigdigits = 4),
-        "  (true ", round.(p_abs_true.Q_int_unocc, sigdigits = 4), ")")
-
-# Report the identifiable (daytime) solar-gain profile for the first solar node.
-# Hours without solar irradiance carry no information, so those coefficients stay
-# near their initial guess.
-println("α_solar[1,:] recovered  = ", round.(p_abs_rec.α_solar[1, :], sigdigits = 3))
-println("α_solar[1,:] true       = ", round.(p_abs_true.α_solar[1, :], sigdigits = 3))

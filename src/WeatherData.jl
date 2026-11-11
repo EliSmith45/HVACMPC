@@ -1,16 +1,10 @@
-# Download hourly weather data from the OpenMeteo API.
-#
-#   * Historical data (temperature, humidity, solar intensity) for a date range
-#   * N-day forecast (up to 16 days), NOAA models for US locations
-#   * Geocodes a US street address -> latitude / longitude
-#
-# Required packages:
-#   using Pkg; Pkg.add(["HTTP", "JSON3", "DataFrames"])
+module WeatherData
 
 using HTTP
 using JSON3
 using Dates
 using DataFrames
+using DataInterpolations
 
 const HOURLY_VARS = ["temperature_2m", "relative_humidity_2m", "shortwave_radiation"]
 
@@ -169,25 +163,25 @@ function get_weather(address::String, start_date, end_date, forecast_days::Integ
     return (; location, historical=hist, forecast=fcst)
 end
 
-# ---------------------------------------------------------------------------
-# CLI entry point
-# ---------------------------------------------------------------------------
+"""
+    weather_from_openmeteo(df) -> (T_oa, I_solar)
 
-if abspath(PROGRAM_FILE) == @__FILE__
-    address       = length(ARGS) >= 1 ? ARGS[1] : (print("US address: "); readline())
-    start_date    = length(ARGS) >= 2 ? Date(ARGS[2]) : (print("Start date (YYYY-MM-DD): "); Date(readline()))
-    end_date      = length(ARGS) >= 3 ? Date(ARGS[3]) : (print("End date (YYYY-MM-DD): "); Date(readline()))
-    forecast_days = length(ARGS) >= 4 ? parse(Int, ARGS[4]) : (print("Forecast days (1-16): "); parse(Int, readline()))
+Build hourly `LinearInterpolation` objects for outdoor-air temperature (°F) and
+solar irradiance (W/m²) from an OpenMeteo hourly `DataFrame` (columns
+`temperature_2m` and `shortwave_radiation`, as returned by
+`download_historical`/`download_forecast`).  The time axis is hours since the
+first row, so hour 0 is the first timestamp and the model's 24 h clock
+(`mod(t, 24)`) aligns with local clock time.
+"""
+function weather_from_openmeteo(df)
+    n = nrow(df)
+    t_hours = collect(0.0:(n - 1))
+    T_oa = LinearInterpolation(collect(Float64.(df.temperature_2m)), t_hours)
+    I_solar = LinearInterpolation(collect(Float64.(df.shortwave_radiation)), t_hours)
+    return T_oa, I_solar
+end
 
-    loc = geocode_address(address)
-    println("Location: $(loc.matched_address)  (source: $(loc.source))")
-    println("Coordinates: lat=$(loc.latitude), lon=$(loc.longitude)\n")
+export geocode_address, download_historical, download_forecast, get_weather,
+       weather_from_openmeteo
 
-    hist = download_historical(loc.latitude, loc.longitude, start_date, end_date)
-    println("Historical data ($start_date → $end_date): $(nrow(hist)) hourly rows")
-    show(first(hist, 5), allcols=true); println()
-
-    fcst = download_forecast(loc.latitude, loc.longitude, forecast_days)
-    println("\nForecast ($forecast_days days): $(nrow(fcst)) hourly rows")
-    show(first(fcst, 5), allcols=true); println()
 end
